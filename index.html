@@ -88,6 +88,17 @@
       min-width: 180px;
     }
 
+    input.url-input {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 12px;
+      font-size: 14px;
+      min-width: 260px;
+      max-width: 360px;
+    }
+
     .file-label {
       display: inline-flex;
       align-items: center;
@@ -339,6 +350,8 @@
       </div>
       <div class="toolbar">
         <select id="modelSelect" class="model-select" aria-label="选择模型"></select>
+        <input id="sharedCsvUrlInput" class="url-input" type="url" placeholder="粘贴共享 CSV 链接（https://...）" />
+        <button id="applySharedCsvBtn" class="ghost">应用共享链接</button>
         <button id="downloadTemplateBtn" class="ghost">下载当前模型模板CSV</button>
         <button id="exportCSVBtn" class="ghost">导出当前模型CSV</button>
         <button id="clearModelBtn" class="ghost">清空当前模型数据</button>
@@ -580,6 +593,7 @@
 
     const STORAGE_PREFIX = 'shi-dashboard:v1:';
     const DEFAULT_MODEL_KEY = 'base';
+    const DEFAULT_SHARED_CSV_URL = 'https://shigangfan47-bit.github.io/shiguangfan/table.csv';
 
     const KPI_TARGETS = {
       posts: 12,
@@ -1247,8 +1261,12 @@
         // 区分来源：用户上传的 CSV 需要在刷新/重新打开时优先使用。
         const sourceType = meta.sourceType || 'relative';
         const updatedAt = Number.isFinite(meta.updatedAt) ? meta.updatedAt : Date.now();
+        const remoteUrl = meta.remoteUrl ? String(meta.remoteUrl).trim() : '';
         localStorage.setItem(`${STORAGE_PREFIX}${modelKey}:sourceType`, sourceType);
         localStorage.setItem(`${STORAGE_PREFIX}${modelKey}:updatedAt`, String(updatedAt));
+        if (remoteUrl) {
+          localStorage.setItem(`${STORAGE_PREFIX}${modelKey}:remoteUrl`, remoteUrl);
+        }
       } catch {
         // localStorage 可能被禁用；此时仍保留页面内状态，不影响看板渲染
       }
@@ -1261,11 +1279,22 @@
         const csvText = localStorage.getItem(`${STORAGE_PREFIX}${modelKey}:csvText`) || null;
         const sourceType = localStorage.getItem(`${STORAGE_PREFIX}${modelKey}:sourceType`) || '';
         const updatedAt = Number(localStorage.getItem(`${STORAGE_PREFIX}${modelKey}:updatedAt`) || '0');
-        if (records && records.length) return { headers, records, csvText, sourceType, updatedAt };
+        const remoteUrl = localStorage.getItem(`${STORAGE_PREFIX}${modelKey}:remoteUrl`) || '';
+        if (records && records.length) return { headers, records, csvText, sourceType, updatedAt, remoteUrl };
       } catch {
         // ignore
       }
       return null;
+    }
+
+    function getSharedCSVUrlFromQuery() {
+      try {
+        const url = new URL(window.location.href);
+        const csv = (url.searchParams.get('csv') || '').trim();
+        return csv || DEFAULT_SHARED_CSV_URL;
+      } catch {
+        return DEFAULT_SHARED_CSV_URL;
+      }
     }
 
     function renderFromRecords(modelKey, headers, records, sourceLabel, csvTextForExport = null) {
@@ -1313,6 +1342,7 @@
         csvText: saved.csvText,
         sourceType: saved.sourceType || 'relative',
         updatedAt: saved.updatedAt || 0,
+        remoteUrl: saved.remoteUrl || '',
         sourceLabel:
           saved.sourceType === 'uploaded'
             ? `本地上传（${getModel(modelKey).label}）`
@@ -1320,10 +1350,40 @@
       };
     }
 
+    async function getRemoteData(modelKey, remoteUrl) {
+      if (!remoteUrl) throw new Error('共享 CSV 链接为空。');
+      const response = await fetch(remoteUrl);
+      if (!response.ok) throw new Error(`读取共享 CSV 失败：HTTP ${response.status}`);
+      const csvText = await response.text();
+      const parsed = recordsFromCSVText(csvText);
+      return {
+        modelKey,
+        headers: parsed.headers,
+        records: parsed.records,
+        csvText,
+        sourceType: 'remote',
+        remoteUrl,
+        sourceLabel: `共享链接：${remoteUrl}`,
+      };
+    }
+
     async function resolveActiveData(modelKey, { preferRelative = true, ignoreLocalOverride = false } = {}) {
       // 始终可用：模板数据（用于“默认值/兜底”）
       const templateData = getTemplateData(modelKey);
       const saved = getLocalSavedData(modelKey);
+      const queryRemoteUrl = getSharedCSVUrlFromQuery();
+      const savedRemoteUrl = saved?.remoteUrl || '';
+      const remoteUrl = queryRemoteUrl || savedRemoteUrl;
+
+      // 支持共享链接：?csv=https://example.com/data.csv（优先于本地上传与相对路径）
+      if (remoteUrl) {
+        try {
+          const remote = await getRemoteData(modelKey, remoteUrl);
+          return { ...remote, used: 'remote' };
+        } catch {
+          // 共享链接失败则继续走原有兜底链路
+        }
+      }
 
       // 如果是用户上传保存的“最新 CSV”，刷新时优先使用本地覆盖数据。
       if (!ignoreLocalOverride && saved && saved.sourceType === 'uploaded') {
@@ -1350,6 +1410,10 @@
       const m = getModel(modelKey);
       el('modelText').textContent = `模型：${m.label}`;
       el('reloadBtn').textContent = `重新读取 ${m.relativeCSVPath}`;
+      const queryRemoteUrl = getSharedCSVUrlFromQuery();
+      const saved = loadModelFromLocalStorage(modelKey);
+      const remoteValue = queryRemoteUrl || saved?.remoteUrl || '';
+      el('sharedCsvUrlInput').value = remoteValue;
       el('fileInput').value = '';
     }
 
@@ -1367,10 +1431,11 @@
       try {
         const resolved = await resolveActiveData(modelKey, { preferRelative, ignoreLocalOverride });
         renderFromRecords(resolved.modelKey, resolved.headers, resolved.records, resolved.sourceLabel, resolved.csvText);
-        if (resolved.used === 'relative') {
+        if (resolved.used === 'relative' || resolved.used === 'remote') {
           saveModelToLocalStorage(resolved.modelKey, resolved.headers, resolved.records, resolved.csvText, {
-            sourceType: 'relative',
+            sourceType: resolved.used === 'remote' ? 'remote' : 'relative',
             updatedAt: Date.now(),
+            remoteUrl: resolved.remoteUrl || '',
           });
         }
       } catch (err) {
@@ -1421,6 +1486,26 @@
       downloadText(filename, getTemplateCSVForModel(state.activeModelKey));
     });
 
+    el('applySharedCsvBtn').addEventListener('click', async () => {
+      const remoteUrl = String(el('sharedCsvUrlInput').value || '').trim();
+      if (!/^https?:\/\//i.test(remoteUrl)) {
+        setError('共享 CSV 链接格式不正确，请使用 http(s) 开头。');
+        return;
+      }
+      try {
+        clearError();
+        const data = await getRemoteData(state.activeModelKey, remoteUrl);
+        renderFromRecords(data.modelKey, data.headers, data.records, data.sourceLabel, data.csvText);
+        saveModelToLocalStorage(data.modelKey, data.headers, data.records, data.csvText, {
+          sourceType: 'remote',
+          updatedAt: Date.now(),
+          remoteUrl,
+        });
+      } catch (err) {
+        setError(err.message || '共享 CSV 读取失败。');
+      }
+    });
+
     el('exportCSVBtn').addEventListener('click', () => {
       const headers = state.originalHeaders && state.originalHeaders.length ? state.originalHeaders : (state.originalRecords?.[0] ? Object.keys(state.originalRecords[0]) : []);
       const csvText = buildCSV(headers, state.originalRecords);
@@ -1436,6 +1521,7 @@
         localStorage.removeItem(`${STORAGE_PREFIX}${state.activeModelKey}:csvText`);
         localStorage.removeItem(`${STORAGE_PREFIX}${state.activeModelKey}:sourceType`);
         localStorage.removeItem(`${STORAGE_PREFIX}${state.activeModelKey}:updatedAt`);
+        localStorage.removeItem(`${STORAGE_PREFIX}${state.activeModelKey}:remoteUrl`);
       } catch {
         // ignore
       }
