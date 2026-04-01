@@ -1238,11 +1238,17 @@
       URL.revokeObjectURL(url);
     }
 
-    function saveModelToLocalStorage(modelKey, headers, records, csvText) {
+    function saveModelToLocalStorage(modelKey, headers, records, csvText, meta = {}) {
       try {
         localStorage.setItem(`${STORAGE_PREFIX}${modelKey}:headers`, JSON.stringify(headers));
         localStorage.setItem(`${STORAGE_PREFIX}${modelKey}:records`, JSON.stringify(records));
         localStorage.setItem(`${STORAGE_PREFIX}${modelKey}:csvText`, csvText);
+
+        // 区分来源：用户上传的 CSV 需要在刷新/重新打开时优先使用。
+        const sourceType = meta.sourceType || 'relative';
+        const updatedAt = Number.isFinite(meta.updatedAt) ? meta.updatedAt : Date.now();
+        localStorage.setItem(`${STORAGE_PREFIX}${modelKey}:sourceType`, sourceType);
+        localStorage.setItem(`${STORAGE_PREFIX}${modelKey}:updatedAt`, String(updatedAt));
       } catch {
         // localStorage 可能被禁用；此时仍保留页面内状态，不影响看板渲染
       }
@@ -1253,7 +1259,9 @@
         const headers = JSON.parse(localStorage.getItem(`${STORAGE_PREFIX}${modelKey}:headers`) || '[]');
         const records = JSON.parse(localStorage.getItem(`${STORAGE_PREFIX}${modelKey}:records`) || '[]');
         const csvText = localStorage.getItem(`${STORAGE_PREFIX}${modelKey}:csvText`) || null;
-        if (records && records.length) return { headers, records, csvText };
+        const sourceType = localStorage.getItem(`${STORAGE_PREFIX}${modelKey}:sourceType`) || '';
+        const updatedAt = Number(localStorage.getItem(`${STORAGE_PREFIX}${modelKey}:updatedAt`) || '0');
+        if (records && records.length) return { headers, records, csvText, sourceType, updatedAt };
       } catch {
         // ignore
       }
@@ -1303,21 +1311,36 @@
         headers: saved.headers,
         records: saved.records,
         csvText: saved.csvText,
-        sourceLabel: `本地保存（${getModel(modelKey).label}）`,
+        sourceType: saved.sourceType || 'relative',
+        updatedAt: saved.updatedAt || 0,
+        sourceLabel:
+          saved.sourceType === 'uploaded'
+            ? `本地上传（${getModel(modelKey).label}）`
+            : `本地保存（${getModel(modelKey).label}）`,
       };
     }
 
-    async function resolveActiveData(modelKey, { preferRelative = true } = {}) {
+    async function resolveActiveData(modelKey, { preferRelative = true, ignoreLocalOverride = false } = {}) {
       // 始终可用：模板数据（用于“默认值/兜底”）
       const templateData = getTemplateData(modelKey);
-      if (!preferRelative) return { ...templateData, used: 'template' };
+      const saved = getLocalSavedData(modelKey);
+
+      // 如果是用户上传保存的“最新 CSV”，刷新时优先使用本地覆盖数据。
+      if (!ignoreLocalOverride && saved && saved.sourceType === 'uploaded') {
+        return { ...saved, used: 'local' };
+      }
+
+      // 不偏向相对路径时：有本地缓存就用本地；没有再用模板兜底
+      if (!preferRelative) {
+        if (saved) return { ...saved, used: 'local' };
+        return { ...templateData, used: 'template' };
+      }
 
       // 优先相对路径 -> 失败则 localStorage -> 仍失败则模板，并把错误抛出去用于提示
       try {
         const relative = await getRelativeData(modelKey);
         return { ...relative, used: 'relative' };
       } catch (err) {
-        const saved = getLocalSavedData(modelKey);
         if (saved) return { ...saved, used: 'local' };
         throw err; // 调用方会显示错误，同时页面仍已经渲染了模板兜底
       }
@@ -1330,7 +1353,7 @@
       el('fileInput').value = '';
     }
 
-    async function refreshActiveModel({ preferRelative = true } = {}) {
+    async function refreshActiveModel({ preferRelative = true, ignoreLocalOverride = false } = {}) {
       clearError();
 
       const modelKey = state.activeModelKey;
@@ -1342,10 +1365,13 @@
 
       // 再尝试加载真实数据，并把“数据-渲染-保存”串成闭环
       try {
-        const resolved = await resolveActiveData(modelKey, { preferRelative });
+        const resolved = await resolveActiveData(modelKey, { preferRelative, ignoreLocalOverride });
         renderFromRecords(resolved.modelKey, resolved.headers, resolved.records, resolved.sourceLabel, resolved.csvText);
         if (resolved.used === 'relative') {
-          saveModelToLocalStorage(resolved.modelKey, resolved.headers, resolved.records, resolved.csvText);
+          saveModelToLocalStorage(resolved.modelKey, resolved.headers, resolved.records, resolved.csvText, {
+            sourceType: 'relative',
+            updatedAt: Date.now(),
+          });
         }
       } catch (err) {
         // 只有相对路径也失败且本地没有保存时才提示；模板已渲染，不会让看板空白
@@ -1358,12 +1384,16 @@
       const parsed = recordsFromCSVText(text);
       const modelKey = state.activeModelKey;
       renderFromRecords(modelKey, parsed.headers, parsed.records, `上传：${file.name}`, text);
-      saveModelToLocalStorage(modelKey, parsed.headers, parsed.records, text);
+      saveModelToLocalStorage(modelKey, parsed.headers, parsed.records, text, {
+        sourceType: 'uploaded',
+        updatedAt: Date.now(),
+      });
     }
 
     el('reloadBtn').addEventListener('click', async () => {
       try {
-        await refreshActiveModel({ preferRelative: true });
+        // “重新读取”应忽略用户上传覆盖，重新拉取相对路径 CSV。
+        await refreshActiveModel({ preferRelative: true, ignoreLocalOverride: true });
       } catch (err) {
         setError(err.message || '读取相对路径 CSV 失败。');
       }
@@ -1404,6 +1434,8 @@
         localStorage.removeItem(`${STORAGE_PREFIX}${state.activeModelKey}:headers`);
         localStorage.removeItem(`${STORAGE_PREFIX}${state.activeModelKey}:records`);
         localStorage.removeItem(`${STORAGE_PREFIX}${state.activeModelKey}:csvText`);
+        localStorage.removeItem(`${STORAGE_PREFIX}${state.activeModelKey}:sourceType`);
+        localStorage.removeItem(`${STORAGE_PREFIX}${state.activeModelKey}:updatedAt`);
       } catch {
         // ignore
       }
